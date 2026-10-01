@@ -88,3 +88,4 @@ Browser tests exercise two real WebRTC peers with synthetic audio, received RTP 
 - `native/android/`: launcher activity, capture service, Android manifest.
 - `assets/main.css`: responsive design.
 - `scripts/`: local SDK setup and native install/launch helpers.
+# vibe-musictalk
