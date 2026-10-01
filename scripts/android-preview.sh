@@ -4,7 +4,7 @@ set -eu
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$script_dir/.."
 . "$script_dir/android-env.sh"
-export MUSICTALK_SERVER_URL="${MUSICTALK_SERVER_URL:-http://127.0.0.1:8080}"
+export MUSICTALK_SERVER_URL="${MUSICTALK_SERVER_URL:-https://musictalk.ashupednekar49.workers.dev}"
 # A licensed Command Line Tools installation also supports Android builds.
 if [ -d /Library/Developer/CommandLineTools ]; then export DEVELOPER_DIR=/Library/Developer/CommandLineTools; fi
 dx build --platform android --release --no-default-features --features mobile --fullstack false

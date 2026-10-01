@@ -4,7 +4,7 @@ set -eu
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$script_dir/.."
 export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
-export MUSICTALK_SERVER_URL="${MUSICTALK_SERVER_URL:-http://127.0.0.1:8080}"
+export MUSICTALK_SERVER_URL="${MUSICTALK_SERVER_URL:-https://musictalk.ashupednekar49.workers.dev}"
 xcrun simctl list devices available
 # Use a caller-selected simulator, or the first available iPhone.
 if [ -z "${MUSICTALK_SIMULATOR:-}" ]; then

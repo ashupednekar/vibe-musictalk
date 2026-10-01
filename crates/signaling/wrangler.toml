@@ -1,0 +1,25 @@
+name = "musictalk"
+main = "build/index.js"
+compatibility_date = "2026-05-03"
+workers_dev = true
+
+[vars]
+WEB_ORIGIN = "https://musictalk.pages.dev"
+
+[build]
+command = "worker-build --release --no-opt"
+cwd = "."
+
+[assets]
+directory = "../../target/dx/musictalk/release/web/public"
+binding = "ASSETS"
+run_worker_first = ["/api/*"]
+not_found_handling = "single-page-application"
+
+[[durable_objects.bindings]]
+name = "ROOMS"
+class_name = "CallRoom"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["CallRoom"]

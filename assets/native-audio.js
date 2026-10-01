@@ -1,9 +1,17 @@
-// Android sends PCM locally into a WebAudio stream; WebRTC encrypts and transports it.
+// Native capture sends PCM locally into a WebAudio stream; WebRTC transports audio only.
 let nativeContext, nativeNode, nativeDestination, nativeResolve, nativeReject;
+let nativeCaptureGeneration = 0;
 window.musictalkNative = {
-    started() { nativeResolve?.(nativeDestination.stream); nativeResolve = null; nativeReject = null; },
+    cancel() {
+        nativeCaptureGeneration++;
+        const reject = nativeReject; nativeResolve = null; nativeReject = null;
+        reject?.(new DOMException('Call ended.', 'AbortError'));
+        nativeDestination?.stream.getTracks().forEach(t => t.stop());
+        nativeNode?.disconnect(); nativeContext?.close(); nativeContext = null; nativeNode = null; nativeDestination = null;
+    },
+    started() { if (nativeResolve && nativeDestination) nativeResolve(nativeDestination.stream); nativeResolve = null; nativeReject = null; },
     error(message) { if (nativeReject) { nativeReject(new Error(message)); nativeResolve = null; nativeReject = null; } else fail(message); },
-    stopped() { if (shared) stopSharing(); nativeContext?.close(); nativeContext = null; nativeNode = null; },
+    stopped() { if (shared) stopSharing(); else this.cancel(); },
     push(encoded) {
         if (!nativeNode) return;
         const bytes = Uint8Array.from(atob(encoded), c => c.charCodeAt(0));
@@ -14,8 +22,11 @@ window.musictalkNative = {
     }
 };
 async function captureNativeAudio() {
-    nativeContext = new AudioContext({sampleRate:48000});
-    await nativeContext.resume();
+    const generation = ++nativeCaptureGeneration;
+    const context = nativeContext = new AudioContext({sampleRate:48000});
+    const active = () => { if (generation !== nativeCaptureGeneration) throw new DOMException('Call ended.','AbortError'); };
+    try {
+    await context.resume(); active();
     const processor = `class SharedAudio extends AudioWorkletProcessor {
         constructor() { super(); this.buffer = new Float32Array(96000); this.read = 0; this.write = 0; this.count = 0; this.warmed = false;
             this.port.onmessage = ({data}) => { for (const sample of data) { this.buffer[this.write] = sample; this.write = (this.write + 1) % this.buffer.length;
@@ -29,11 +40,19 @@ async function captureNativeAudio() {
         }
     } registerProcessor('musictalk-audio', SharedAudio);`;
     const url = URL.createObjectURL(new Blob([processor],{type:'text/javascript'}));
-    try { await nativeContext.audioWorklet.addModule(url); } finally { URL.revokeObjectURL(url); }
-    nativeNode = new AudioWorkletNode(nativeContext,'musictalk-audio',{numberOfInputs:0,numberOfOutputs:1,outputChannelCount:[2]});
-    nativeDestination = nativeContext.createMediaStreamDestination();
+    try { await context.audioWorklet.addModule(url); active(); } finally { URL.revokeObjectURL(url); }
+    nativeNode = new AudioWorkletNode(context,'musictalk-audio',{numberOfInputs:0,numberOfOutputs:1,outputChannelCount:[2]});
+    nativeDestination = context.createMediaStreamDestination();
     nativeNode.connect(nativeDestination);
-    try {
-        return await new Promise((resolve,reject) => { nativeResolve = resolve; nativeReject = reject; window.MusicTalkAudio.start(); });
-    } catch (e) { await nativeContext.close(); nativeNode = null; throw e; }
+        return await new Promise((resolve,reject) => {
+            const timer = setTimeout(() => { window.MusicTalkAudio.stop(); nativeReject?.(new Error('Audio capture was not started.')); }, 60000);
+            nativeResolve = stream => { clearTimeout(timer); resolve(stream); };
+            nativeReject = error => { clearTimeout(timer); reject(error); };
+            window.MusicTalkAudio.start();
+        });
+    } catch (e) {
+        if (nativeContext === context) { nativeResolve = null; nativeReject = null; nativeContext = null; nativeNode = null; nativeDestination = null; }
+        if (context.state !== 'closed') await context.close();
+        throw e;
+    }
 }

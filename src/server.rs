@@ -1,4 +1,3 @@
-use crate::model::*;
 use axum::{
     extract::{
         ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
@@ -10,6 +9,7 @@ use axum::{
     Json, Router,
 };
 use futures_util::{SinkExt, StreamExt};
+use musictalk_protocol::*;
 use serde_json::{json, Value};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{mpsc, Mutex};

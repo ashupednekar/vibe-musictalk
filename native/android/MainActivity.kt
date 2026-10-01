@@ -44,7 +44,7 @@ class MainActivity : WryActivity() {
             } else manager.createScreenCaptureIntent()
             startActivityForResult(captureIntent, 4201)
         } }
-        @JavascriptInterface fun stop() { runOnUiThread { stopService(Intent(this@MainActivity, AudioShareService::class.java)) } }
+        @JavascriptInterface fun stop() { runOnUiThread { awaitingCapture = false; stopService(Intent(this@MainActivity, AudioShareService::class.java)) } }
         @JavascriptInterface fun copy(text: String) {
             val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             clipboard.setPrimaryClip(ClipData.newPlainText("MusicTalk invite", text))
@@ -55,6 +55,7 @@ class MainActivity : WryActivity() {
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode != 4201) return
+        if (!awaitingCapture) return
         awaitingCapture = false
         if (resultCode != RESULT_OK || data == null) { error("Audio sharing was cancelled."); return }
         val intent = Intent(this, AudioShareService::class.java).putExtra("resultCode", resultCode).putExtra("projectionData", data)

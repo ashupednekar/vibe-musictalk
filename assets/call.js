@@ -1,11 +1,15 @@
 // The same bridge runs in the browser and the bundled native WebView.
 const launch = await dioxus.recv();
 const native = !!launch.native;
-let serverBase = new URL((native && localStorage.getItem('musictalk-server')) || launch.serverUrl || location.origin);
+const savedServer = native && localStorage.getItem('musictalk-server');
+// Migrate temporary tunnel URLs from earlier development builds.
+const retiredTunnel = savedServer && new URL(savedServer).hostname.endsWith('.trycloudflare.com');
+if (retiredTunnel) localStorage.removeItem('musictalk-server');
+let serverBase = new URL((!retiredTunnel && savedServer) || launch.serverUrl || location.origin);
 const smokeInvite = native && launch.testInvite ? new URL(launch.testInvite) : null;
 if (smokeInvite) serverBase = new URL(smokeInvite.origin);
 if (window.musictalk) window.musictalk.dispose();
-const state = { room: { people: [], messages: [] }, me: '', status: 'Connecting to your room…', connected: false, voice: false, muted: false, sharing: false, peer_connected: false, copied: false, error: '', notice: '', elapsed_ms: 0, can_share: !!window.MusicTalkAudio || !!navigator.mediaDevices?.getDisplayMedia };
+const state = { room: { people: [], messages: [] }, me: '', status: 'Connecting to your room…', connected: false, voice: false, muted: false, sharing: false, peer_connected: false, copied: false, error: '', notice: '', elapsed_ms: 0, room_code: '', invited: false, joining: false, can_share: (window.MusicTalkAudio && window.MusicTalkAudio.available !== false) || !!navigator.mediaDevices?.getDisplayMedia };
 let ws, pc, mic, shared, reconnect, disposed = false, retry = 0, remoteMusicId = '', remoteVoiceId = '', makingOffer = false, ignoreOffer = false, settingAnswer = false, pendingCandidates = [], remoteTracks = [], callStarted = 0, config;
 let audioGeneration = 0, finish;
 let roomGeneration = 0;
@@ -39,7 +43,7 @@ function attachRemoteTracks() {
         const element = streamId === remoteMusicId ? musicAudio() : streamId === remoteVoiceId ? audio() : null;
         if (element && element.srcObject?.getTracks()[0]?.id !== track.id) {
             element.srcObject = new MediaStream([track]);
-            element.play().catch(() => notice('Tap Join the conversation or Enable sound to hear your person.'));
+            element.play().catch(() => notice('Tap here to enable call audio.'));
         }
     }
 }
@@ -106,13 +110,16 @@ async function receiveSignal(message) {
 }
 
 const params = new URLSearchParams(location.search);
+state.invited = !!params.get('room') || !!smokeInvite;
+function makeRoomCode() { const alphabet = '0123456789abcdefghjkmnpqrstvwxyz'; return [...crypto.getRandomValues(new Uint8Array(12))].map(n => alphabet[n & 31]).join(''); }
 let roomId = smokeInvite?.searchParams.get('room') || params.get('room') || (native && sessionStorage.getItem('musictalk-room'));
 if (!roomId || !/^[a-zA-Z0-9_-]{12,64}$/.test(roomId)) {
-    roomId = crypto.randomUUID().replaceAll('-', '');
+    roomId = makeRoomCode();
     params.set('room', roomId);
     if (!native) history.replaceState({}, '', `${location.pathname}?${params}`);
     else sessionStorage.setItem('musictalk-room', roomId);
 }
+state.room_code = roomId;
 function connect() {
     if (disposed) return;
     state.status = retry ? 'Reconnecting to your room…' : 'Connecting to your room…'; emit();
@@ -151,7 +158,7 @@ function connect() {
             rejected = true; state.error = 'This room already has two people.';
         }
         state.connected = false; closePeer();
-        state.status = rejected ? 'Room full · start a new room from the logo' : 'Connection lost · reconnecting…'; emit();
+        state.status = rejected ? 'Room full · start another call' : 'Connection lost · reconnecting…'; emit();
         if (!rejected) reconnect = setTimeout(connect, Math.min(1000 * 2 ** retry++, 15000));
     };
     ws.onerror = () => { state.status = 'Cannot reach the room server'; emit(); };
@@ -159,6 +166,7 @@ function connect() {
 function stopSharing() {
     const stream = shared; shared = null;
     if (window.MusicTalkAudio) window.MusicTalkAudio.stop();
+    window.musictalkNative?.cancel();
     state.sharing = false; updateVoice();
     if (pc && stream) for (const sender of pc.getSenders()) if (sender.track && stream.getTracks().includes(sender.track)) pc.removeTrack(sender);
     if (stream) for (const track of stream.getTracks()) { track.onended = null; track.stop(); }
@@ -179,25 +187,107 @@ function dispose() {
     window.removeEventListener('pagehide', dispose);
     finish?.();
 }
+function parseInvite(input) {
+    input = input.trim();
+    let link;
+    try { link = new URL(input); } catch {}
+    let room = link ? link.searchParams.get('room') || '' : input.replace(/\s|-/g, '').toLowerCase();
+    let server = serverBase;
+    if (link) {
+        const local = ['localhost','127.0.0.1','[::1]'].includes(link.hostname);
+        if (link.protocol !== 'https:' && !(local && link.protocol === 'http:')) throw new Error('Use a secure MusicTalk invite.');
+        server = link.hostname === 'musictalk.pages.dev' ? new URL('https://musictalk.ashupednekar49.workers.dev') : new URL(link.origin);
+    }
+    if (!/^[a-zA-Z0-9_-]{12,64}$/.test(room)) throw new Error('Enter a complete call code or invite link.');
+    return {room, server};
+}
+async function switchRoom(next, nextServer = serverBase) {
+    const generation = ++roomGeneration;
+    leaveVoice(); clearTimeout(reconnect);
+    if (ws) { ws.onclose = null; ws.close(); }
+    roomId = next; state.room_code = roomId; state.room = {people:[],messages:[]}; state.me = ''; state.connected = false;
+    state.status = 'Connecting…'; state.error = ''; state.notice = ''; emit();
+    if (nextServer.origin !== serverBase.origin || !config) {
+        const nextConfig = await fetchConfig(nextServer);
+        if (disposed || generation !== roomGeneration) return;
+        serverBase = nextServer; config = nextConfig;
+    }
+    if (native) { localStorage.setItem('musictalk-server',serverBase.origin); sessionStorage.setItem('musictalk-room',roomId); }
+    else history.replaceState({},'',`${location.pathname}?room=${roomId}`);
+    if (!disposed && generation === roomGeneration) connect();
+}
+function captureAudio() {
+    if (window.MusicTalkAudio?.available !== false && window.MusicTalkAudio) return captureNativeAudio();
+    return navigator.mediaDevices.getDisplayMedia({video:true,audio:{suppressLocalAudioPlayback:false},systemAudio:'include',selfBrowserSurface:'exclude'});
+}
+function attachCapture(capture) {
+    if (!capture.getAudioTracks().length) { capture.getTracks().forEach(t => t.stop()); throw new Error('No audio selected. Include audio in your device’s capture prompt.'); }
+    shared = capture;
+    shared.getTracks().forEach(track => { track.onended = stopSharing; });
+    if (pc) for (const track of shared.getAudioTracks()) pc.addTrack(track, shared);
+    state.sharing = true; updateVoice(); emit();
+}
+async function waitForRoom(generation) {
+    const until = Date.now() + 12000;
+    while (!state.connected || !state.me) {
+        if (disposed || generation !== audioGeneration) throw new Error('Call cancelled.');
+        if (state.status.startsWith('Room full')) throw new Error('This room already has two people.');
+        if (Date.now() > until) throw new Error('Could not join the call. Try again.');
+        await new Promise(resolve => setTimeout(resolve, 50));
+    }
+}
+async function enterCall(command) {
+    if (state.voice || state.joining) return;
+    const next = command.type === 'join_call' ? parseInvite(command.invite) : null;
+    if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) throw new Error('Microphone access requires a secure connection.');
+    const switching = next && (next.room !== roomId || next.server.origin !== serverBase.origin)
+        ? switchRoom(next.room, next.server) : Promise.resolve();
+    const generation = ++audioGeneration;
+    state.joining = true; state.error = ''; state.notice = ''; emit();
+    // Start the OS capture request from the user's Start/Join action, before network awaits.
+    const capture = state.can_share ? captureAudio().then(stream => ({stream}), error => ({error})) : Promise.resolve({});
+    const microphone = navigator.mediaDevices.getUserMedia({video:false,audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}})
+        .then(stream => ({stream}), error => ({error}));
+    let claimedMicrophone = false;
+    try {
+        await switching;
+        await waitForRoom(generation);
+        const result = await microphone;
+        if (result.error) throw result.error;
+        if (disposed || generation !== audioGeneration) { result.stream.getTracks().forEach(t => t.stop()); return; }
+        mic = result.stream; claimedMicrophone = true;
+        state.voice = true; state.muted = false;
+        name = command.name?.trim().slice(0,28) || name || 'Your person';
+        sessionStorage.setItem('musictalk-name',name);
+        mic.getAudioTracks()[0].onended = () => { if (state.voice) { leaveVoice(); fail('Microphone disconnected. Join again.'); } };
+        window.MusicTalkAudio?.callAudio?.();
+        send({type:'profile',name}); updateVoice();
+        for (const element of [audio(),musicAudio()]) { element.srcObject ||= new MediaStream(); element.play().catch(() => {}); }
+        buildPeer(); emit();
+        capture.then(({stream,error}) => {
+            if (disposed || generation !== audioGeneration || !state.voice) { stream?.getTracks().forEach(t => t.stop()); return; }
+            if (error) { state.notice = 'Voice is on. Audio sharing was not started.'; emit(); return; }
+            if (stream) { try { attachCapture(stream); } catch (error) { state.notice = error.message; emit(); } }
+        });
+    } catch (error) {
+        if (generation === audioGeneration) leaveVoice();
+        capture.then(({stream}) => stream?.getTracks().forEach(t => t.stop()));
+        throw error;
+    } finally {
+        if (!claimedMicrophone) microphone.then(({stream}) => stream?.getTracks().forEach(t => t.stop()));
+        if (generation === audioGeneration || !state.voice) { state.joining = false; emit(); }
+    }
+}
 async function action(command) {
     try {
         switch (command.type) {
-            case 'join_voice': {
-                if (state.voice) { await Promise.allSettled([audio()?.play(), musicAudio()?.play()]); break; }
-                if (!state.connected) throw new Error('Wait for your room to connect first.');
-                if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) throw new Error('Microphone access needs HTTPS or localhost.');
-                name = command.name.trim().slice(0, 28) || name || 'Listener';
-                sessionStorage.setItem('musictalk-name', name);
-                const generation = ++audioGeneration;
-                const stream = await navigator.mediaDevices.getUserMedia({video:false,audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}});
-                if (disposed || generation !== audioGeneration) { stream.getTracks().forEach(t => t.stop()); return; }
-                mic = stream;
-                state.voice = true; state.muted = false;
-                mic.getAudioTracks()[0].onended = () => { if (state.voice) { leaveVoice(); fail('Microphone disconnected. Join again to choose an available microphone.'); } };
-                send({type:'profile',name}); updateVoice();
-                for (const element of [audio(),musicAudio()]) { element.srcObject ||= new MediaStream(); element.play().catch(() => {}); }
-                buildPeer(); state.error = ''; emit(); break;
-            }
+            case 'start_call':
+            case 'join_call':
+            case 'join_voice': await enterCall(command); break;
+            case 'end_call':
+                state.joining = false;
+                await switchRoom(makeRoomCode());
+                break;
             case 'enable_sound':
                 await Promise.all([audio()?.play(), musicAudio()?.play()]);
                 state.notice = ''; emit(); break;
@@ -208,51 +298,23 @@ async function action(command) {
             case 'leave_voice': leaveVoice(); break;
             case 'share': {
                 if (shared) { stopSharing(); break; }
-                if (!state.voice) throw new Error('Join the conversation before sharing audio.');
-                if (!window.MusicTalkAudio && !navigator.mediaDevices?.getDisplayMedia) throw new Error('This browser cannot share tab audio. Use Chrome or Edge on desktop.');
-                // Capture permission includes a local video track; it is NEVER attached to WebRTC.
+                if (!state.voice || !state.can_share) throw new Error('Audio capture is unavailable.');
                 const generation = audioGeneration;
-                const capture = window.MusicTalkAudio ? await captureNativeAudio() : await navigator.mediaDevices.getDisplayMedia({video:true,audio:{suppressLocalAudioPlayback:false},systemAudio:'include',selfBrowserSurface:'exclude'});
-                if (disposed || generation !== audioGeneration || !state.voice) { capture.getTracks().forEach(t => t.stop()); window.MusicTalkAudio?.stop(); return; }
-                if (!capture.getAudioTracks().length) { capture.getTracks().forEach(t => t.stop()); throw new Error('No audio was shared. Choose a music tab and check “Share tab audio” in the picker.'); }
-                shared = capture;
-                shared.getTracks().forEach(track => { track.onended = stopSharing; });
-                // Only audio senders. The microphone and music remain separate for independent volume.
-                if (pc) for (const track of shared.getAudioTracks()) pc.addTrack(track, shared);
-                state.sharing = true; updateVoice(); notice(native ? 'Your device audio is ready to share.' : 'Your tab audio is ready to share. Video never leaves your device.'); emit(); break;
+                const capture = await captureAudio();
+                if (disposed || generation !== audioGeneration || !state.voice) { capture.getTracks().forEach(t => t.stop()); return; }
+                attachCapture(capture); break;
             }
             case 'volume': if (musicAudio()) musicAudio().volume = Math.max(0, Math.min(1, command.value / 100)); break;
-            case 'new_room':
+            case 'new_room': await switchRoom(makeRoomCode()); break;
             case 'join_room': {
-                let next = crypto.randomUUID().replaceAll('-', '');
-                let nextServer = serverBase;
-                if (command.type === 'join_room') {
-                    const input = command.invite.trim();
-                    let link;
-                    try { link = new URL(input); } catch { next = input; }
-                    if (link) {
-                        const local = ['localhost','127.0.0.1','[::1]'].includes(link.hostname);
-                        if (link.protocol !== 'https:' && !(local && link.protocol === 'http:')) throw new Error('Use a secure HTTPS invite link.');
-                        next = link.searchParams.get('room') || '';
-                        nextServer = new URL(link.origin);
-                    }
-                    if (!/^[a-zA-Z0-9_-]{12,64}$/.test(next)) throw new Error('Paste a complete MusicTalk invite link or room code.');
-                    if (!native && nextServer.origin !== serverBase.origin) { location.assign(`${nextServer.origin}/?room=${encodeURIComponent(next)}`); break; }
-                }
-                const generation = ++roomGeneration;
-                leaveVoice(); clearTimeout(reconnect);
-                if (ws) { ws.onclose = null; ws.close(); }
-                roomId = next; state.room = {people:[],messages:[]}; state.me = ''; state.connected = false;
-                state.status = 'Connecting to your room…'; state.error = ''; emit();
-                if (native) {
-                    const nextConfig = await fetchConfig(nextServer);
-                    if (disposed || generation !== roomGeneration) break;
-                    serverBase = nextServer; config = nextConfig;
-                    localStorage.setItem('musictalk-server',serverBase.origin);
-                    sessionStorage.setItem('musictalk-room',roomId);
-                }
-                else history.replaceState({},'',`${location.pathname}?room=${roomId}`);
-                connect(); break;
+                const next = parseInvite(command.invite);
+                await switchRoom(next.room, next.server); break;
+            }
+            case 'copy_code': {
+                const code = roomId.toUpperCase().match(/.{1,4}/g).join(' ');
+                try { if (window.MusicTalkAudio) window.MusicTalkAudio.copy(code); else await navigator.clipboard.writeText(code); state.copied = true; emit(); setTimeout(() => { state.copied = false; emit(); },2500); }
+                catch { window.prompt('Your call code:',code); }
+                break;
             }
             case 'invite':
                 try { if (window.MusicTalkAudio) window.MusicTalkAudio.copy(`${serverBase.origin}/?room=${roomId}`); else await navigator.clipboard.writeText(`${serverBase.origin}/?room=${roomId}`); state.copied = true; emit(); setTimeout(() => { state.copied = false; emit(); }, 2500); }
