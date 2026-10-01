@@ -98,10 +98,10 @@ A personal Apple account can use Xcode's Personal Team for development; the setu
 ```sh
 . scripts/android-env.sh
 export MUSICTALK_SERVER_URL=https://musictalk.ashupednekar49.workers.dev
-dx build --platform android --release --no-default-features --features mobile --fullstack false
+sh scripts/android-build.sh
 ```
 
-The APK is at `target/dx/musictalk/release/android/app/app/build/outputs/apk/debug/app-debug.apk`. Dioxus builds Rust in release mode but currently packages a development-signed Gradle APK. It can be installed directly for testing; store distribution needs release signing.
+The APK is copied to `dist/MusicTalk.apk` and also remains at `target/dx/musictalk/release/android/app/app/build/outputs/apk/debug/app-debug.apk`. The build helper adds the generated adaptive Android launcher icon after Dioxus generates the Android project. Dioxus builds Rust in release mode but currently packages a development-signed Gradle APK. It can be installed directly for testing; store distribution needs release signing.
 
 To install and open it on an ADB-connected Android device:
 

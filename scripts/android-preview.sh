@@ -7,7 +7,7 @@ cd "$script_dir/.."
 export MUSICTALK_SERVER_URL="${MUSICTALK_SERVER_URL:-https://musictalk.ashupednekar49.workers.dev}"
 # A licensed Command Line Tools installation also supports Android builds.
 if [ -d /Library/Developer/CommandLineTools ]; then export DEVELOPER_DIR=/Library/Developer/CommandLineTools; fi
-dx build --platform android --release --no-default-features --features mobile --fullstack false
+sh "$script_dir/android-build.sh"
 adb wait-for-device
 adb reverse tcp:8080 tcp:8080
 adb install -r target/dx/musictalk/release/android/app/app/build/outputs/apk/debug/app-debug.apk
