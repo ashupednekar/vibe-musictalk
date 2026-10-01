@@ -1,0 +1,44 @@
+[application]
+name = "MusicTalk"
+android_main_activity = "native/android/MainActivity.kt"
+android_manifest = "native/android/AndroidManifest.xml"
+
+[web.app]
+title = "MusicTalk · Better together"
+
+[web.resource]
+style = []
+script = []
+
+[web.resource.dev]
+script = []
+
+[bundle]
+identifier = "dev.musictalk"
+publisher = "MusicTalk"
+
+[permissions]
+microphone = { description = "Talk privately with your person." }
+local-network = { description = "Connect to your local MusicTalk server during development." }
+
+[android]
+min_sdk = 29
+compile_sdk = 35
+target_sdk = 35
+
+[android.permissions]
+"android.permission.FOREGROUND_SERVICE" = { description = "Keep audio sharing active while you play music." }
+"android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" = { description = "Share your device audio after you approve the system picker." }
+"android.permission.MODIFY_AUDIO_SETTINGS" = { description = "Route call audio to your headphones or speaker." }
+
+[android.application]
+uses_cleartext_traffic = true
+
+[ios]
+deployment_target = "15.0"
+
+[ios.plist]
+NSAppTransportSecurity = { NSAllowsLocalNetworking = true }
+
+[android.raw]
+application = '<service android:name="dev.dioxus.main.AudioShareService" android:foregroundServiceType="mediaProjection" android:exported="false" />'

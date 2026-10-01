@@ -1,0 +1,6 @@
+{
+  "name": "musictalk-browser-tests",
+  "private": true,
+  "scripts": { "test": "node tests/browser.cjs", "test:android": "node --experimental-websocket tests/android.cjs" },
+  "devDependencies": { "playwright": "1.63.0" }
+}

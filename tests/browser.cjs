@@ -1,0 +1,34 @@
+const {chromium}=require('playwright');
+const assert=require('node:assert/strict');
+const fs=require('node:fs');
+const base=process.env.TEST_BASE_URL || 'http://127.0.0.1:8080';
+fs.mkdirSync('tests/artifacts',{recursive:true});
+(async()=>{
+const browser=await chromium.launch({headless:true,args:['--use-fake-device-for-media-stream','--use-fake-ui-for-media-stream','--autoplay-policy=no-user-gesture-required']});
+const contexts=[];const errors=[];
+async function makePage(){const ctx=await browser.newContext({permissions:['microphone','clipboard-write'],viewport:{width:1360,height:1000}});contexts.push(ctx);await ctx.addInitScript(()=>{const Original=window.RTCPeerConnection;window.__pcs=[];window.RTCPeerConnection=new Proxy(Original,{construct(target,args){const pc=new target(...args);window.__pcs.push(pc);return pc;}});});const page=await ctx.newPage();page.on('pageerror',e=>errors.push(e.message));return page;}
+const host=await makePage();await host.goto(base);await host.getByText('Private room · waiting for your person',{exact:true}).waitFor();
+const guest=await makePage();await guest.goto(host.url());await host.getByText('2/2',{exact:true}).waitFor();
+await host.getByLabel('WHAT SHOULD WE CALL YOU?').fill('Ashu');await guest.getByLabel('WHAT SHOULD WE CALL YOU?').fill('Alex');
+await Promise.all([host.getByRole('button',{name:'Join the conversation',exact:true}).click(),guest.getByRole('button',{name:'Join the conversation',exact:true}).click()]);
+await Promise.all([host.getByText('Together, live',{exact:true}).waitFor({timeout:25000}),guest.getByText('Together, live',{exact:true}).waitFor({timeout:25000})]);
+console.log('PASS two browsers connected via WebRTC');
+await host.getByRole('button',{name:'Mute',exact:true}).click();await host.getByRole('button',{name:'Unmute',exact:true}).waitFor();
+assert.equal(await host.evaluate(()=>window.__pcs.at(-1).getSenders().find(s=>s.track)?.track.enabled),false);console.log('PASS microphone mute changes real audio track');
+await host.getByRole('button',{name:'Unmute',exact:true}).click();
+await host.getByLabel('Message',{exact:true}).fill('hello from the other side');await host.getByRole('button',{name:'Send message',exact:true}).click();await guest.getByText('hello from the other side',{exact:true}).waitFor();console.log('PASS room chat');
+await host.evaluate(()=>{navigator.mediaDevices.getDisplayMedia=async()=>{const ctx=new AudioContext();const osc=ctx.createOscillator();osc.frequency.value=440;const destination=ctx.createMediaStreamDestination();osc.connect(destination);osc.start();const canvas=document.createElement('canvas');canvas.width=100;canvas.height=100;const video=canvas.captureStream(10).getVideoTracks()[0];window.__capture=new MediaStream([...destination.stream.getAudioTracks(),video]);window.__oscillator=osc;return window.__capture;};});
+await host.getByRole('button',{name:'Share your audio',exact:true}).click();await host.getByRole('button',{name:'Stop sharing',exact:true}).waitFor();
+await guest.waitForFunction(()=>document.getElementById('remote-music').srcObject?.getAudioTracks().length===1);
+const senders=await host.evaluate(()=>window.__pcs.at(-1).getSenders().filter(s=>s.track).map(s=>s.track.kind));assert.deepEqual(senders,['audio','audio']);
+await guest.waitForFunction(async()=>{const stats=await window.__pcs.at(-1).getStats();return [...stats.values()].filter(s=>s.type==='inbound-rtp'&&s.kind==='audio'&&s.bytesReceived>100).length===2;},{},{timeout:15000});
+console.log('PASS separate microphone + music streams receive real RTP packets; zero video senders');
+await host.getByRole('button',{name:'Stop sharing',exact:true}).click();assert.equal(await host.evaluate(()=>window.__capture.getTracks().every(t=>t.readyState==='ended')),true);console.log('PASS stopping share releases capture');
+const third=await makePage();await third.goto(host.url());await third.getByText('This room already has two people.',{exact:true}).waitFor();console.log('PASS third participant rejected');
+await host.screenshot({path:'tests/artifacts/connected.png',fullPage:true});
+await guest.setViewportSize({width:390,height:844});await guest.screenshot({path:'tests/artifacts/mobile.png',fullPage:true});assert.equal(await guest.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);console.log('PASS mobile layout has no horizontal overflow');
+await host.getByRole('button',{name:'Leave call',exact:true}).click();await guest.getByText('Your person is here',{exact:true}).waitFor();await host.getByRole('button',{name:'Join the conversation',exact:true}).click();await guest.getByText('Together, live',{exact:true}).waitFor({timeout:20000});console.log('PASS leave and rejoin negotiates again');
+await host.close();await guest.getByText('1/2',{exact:true}).waitFor();console.log('PASS disconnected person leaves room');
+assert.deepEqual(errors,[]);console.log('PASS no browser runtime errors');
+await browser.close();
+})().catch(e=>{console.error(e);process.exit(1)});
