@@ -17,7 +17,9 @@ window.musictalkNative = {
         const bytes = Uint8Array.from(atob(encoded), c => c.charCodeAt(0));
         const pcm = new DataView(bytes.buffer);
         const samples = new Float32Array(bytes.length / 2);
-        for (let i = 0; i < samples.length; i++) samples[i] = pcm.getInt16(i * 2, true) / 32768;
+        let peak = 0;
+        for (let i = 0; i < samples.length; i++) { const sample = pcm.getInt16(i * 2, true); samples[i] = sample / 32768; peak = Math.max(peak, Math.abs(sample)); }
+        window.musictalk?.musicLevel(peak);
         nativeNode.port.postMessage(samples, [samples.buffer]);
     }
 };

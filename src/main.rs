@@ -33,12 +33,22 @@ struct BrowserState {
     voice: bool,
     muted: bool,
     sharing: bool,
+    music_active: bool,
+    routes: Vec<AudioRoute>,
+    output: String,
+    route_label: String,
     can_share: bool,
     peer_connected: bool,
     copied: bool,
     error: String,
     notice: String,
     elapsed_ms: u64,
+}
+
+#[derive(Clone, Default, Deserialize)]
+struct AudioRoute {
+    id: String,
+    label: String,
 }
 
 fn action(value: serde_json::Value) {
@@ -51,6 +61,7 @@ fn App() -> Element {
     let mut state = use_signal(BrowserState::default);
     let mut chat = use_signal(String::new);
     let mut show_chat = use_signal(|| false);
+    let mut show_audio = use_signal(|| false);
     let mut invite = use_signal(String::new);
     let mut loaded_invite = use_signal(|| false);
     use_effect(move || {
@@ -128,7 +139,7 @@ fn App() -> Element {
             if !in_call {
                 section { class: "entry-screen",
                     div { class: "entry-icon", Icon { kind: "phone" } }
-                    h1 { "Just you two." }
+                    h1 { "Jam & talk." }
                     p { class: "intro", "Enter their code. Pick up where you left off." }
                     form { class: "entry-form", onsubmit: move |e| {
                         e.prevent_default();
@@ -163,7 +174,9 @@ fn App() -> Element {
                     }
                     if partner_muted { p { class: "quiet-status", "Their mic is muted" } }
                     if view.sharing || partner.is_some_and(|p| p.sharing) {
-                        p { class: "audio-status", Icon { kind: "wave" } if view.sharing { "Your audio is sharing" } else { "Listening to their audio" } }
+                        p { class: "audio-status", Icon { kind: "wave" } if view.sharing {
+                            if view.music_active { "Sharing your device audio" } else { "Ready to share · play music in another app" }
+                        } else { "Their audio sharing is on" } }
                     }
                     div { class: "call-controls",
                         div { class: "control-item", button { class: if view.muted { "round-control selected" } else { "round-control" }, disabled: !view.voice,
@@ -174,6 +187,26 @@ fn App() -> Element {
                             action(json!({"type":"end_call"}));
                         }, Icon { kind: "phone" } } span { "End" } }
                         div { class: "control-item", button { class: if show_chat() { "round-control selected" } else { "round-control" }, aria_label: "Chat", onclick: move |_| show_chat.toggle(), Icon { kind: "message" } } span { "Chat" } }
+                    }
+                    button { class: "audio-route-button", aria_label: "Audio output", disabled: !view.voice, onclick: move |_| {
+                        show_audio.toggle();
+                        action(json!({"type":"audio_routes"}));
+                    }, Icon { kind: "volume" } if view.route_label.is_empty() { "Audio" } else { "{view.route_label}" } }
+                    if view.voice && !view.sharing {
+                        if view.can_share { button { class: "sound-notice", onclick: move |_| action(json!({"type":"retry_sharing"})), "Start device audio sharing" } }
+                        else { p { class: "entry-note", "Device audio sharing is unavailable here. You can still hear their shared audio." } }
+                    }
+                    if show_audio() {
+                        section { class: "audio-sheet", aria_label: "Audio output choices",
+                            div { class: "chat-heading", h2 { "Audio output" } button { class: "icon-button", aria_label: "Close audio output", onclick: move |_| show_audio.set(false), Icon { kind: "close" } } }
+                            for device in &view.routes {
+                                button { class: "audio-choice", aria_pressed: view.output == device.id, onclick: {
+                                    let id = device.id.clone();
+                                    move |_| { action(json!({"type":"audio_output","id":id})); show_audio.set(false); }
+                                }, "{device.label}" if view.output == device.id { Icon { kind: "check" } } }
+                            }
+                            p { class: "entry-note", "Connect headphones or Bluetooth to see them here." }
+                        }
                     }
                     p { class: "encrypted", Icon { kind: "lock" } "Encrypted audio" }
                     if !view.notice.is_empty() {

@@ -9,6 +9,7 @@ import android.os.*
 import android.util.Base64
 import android.webkit.*
 import org.json.JSONObject
+import org.json.JSONArray
 import java.lang.ref.WeakReference
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -19,6 +20,16 @@ class MainActivity : WryActivity() {
     companion object { var current = WeakReference<MainActivity>(null) }
     private var webView: WebView? = null
     private var awaitingCapture = false
+    private var captureRequest = 4200
+    private var activeCaptureRequest = -1
+    private var callActive = false
+    private var route = "auto"
+    private val audioManager by lazy { getSystemService(Context.AUDIO_SERVICE) as AudioManager }
+    private var routeChanged: Any? = null
+    private val devicesChanged = object : AudioDeviceCallback() {
+        override fun onAudioDevicesAdded(devices: Array<AudioDeviceInfo>) { publishRoutes() }
+        override fun onAudioDevicesRemoved(devices: Array<AudioDeviceInfo>) { publishRoutes() }
+    }
 
     override fun onWebViewCreate(webView: WebView) {
         super.onWebViewCreate(webView)
@@ -28,6 +39,49 @@ class MainActivity : WryActivity() {
         webView.settings.mediaPlaybackRequiresUserGesture = false
         // Only the bundled Dioxus page gets this bridge. Do not load external pages in this WebView.
         webView.addJavascriptInterface(AudioBridge(), "MusicTalkAudio")
+        audioManager.registerAudioDeviceCallback(devicesChanged, Handler(Looper.getMainLooper()))
+        if (Build.VERSION.SDK_INT >= 31) {
+            val listener = AudioManager.OnCommunicationDeviceChangedListener { publishRoutes() }
+            routeChanged = listener
+            audioManager.addOnCommunicationDeviceChangedListener(mainExecutor, listener)
+        }
+    }
+
+    private fun communicationDevices(): List<AudioDeviceInfo> = try {
+        if (Build.VERSION.SDK_INT >= 31) audioManager.availableCommunicationDevices
+        else audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).filter { it.type in listOf(
+            AudioDeviceInfo.TYPE_BUILTIN_EARPIECE, AudioDeviceInfo.TYPE_BUILTIN_SPEAKER,
+            AudioDeviceInfo.TYPE_WIRED_HEADSET, AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
+            AudioDeviceInfo.TYPE_BLUETOOTH_SCO, AudioDeviceInfo.TYPE_USB_HEADSET) }
+    } catch (_: SecurityException) { audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).filter {
+        it.type == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE || it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER } }
+
+    fun publishRoutes() {
+        val devices = JSONArray().put(JSONObject().put("id", "auto").put("label", "Automatic"))
+        for (device in communicationDevices()) devices.put(JSONObject().put("id", device.id.toString()).put("label", when (device.type) {
+            AudioDeviceInfo.TYPE_BUILTIN_EARPIECE -> "Phone earpiece"
+            AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> "Speaker"
+            else -> device.productName.toString().ifBlank { "Headphones" }
+        }))
+        val selected = if (Build.VERSION.SDK_INT >= 31) audioManager.communicationDevice?.id?.toString() ?: "auto" else route
+        emit("window.musictalk?.audioRoutes(${JSONObject().put("routes", devices).put("selected", selected)})")
+    }
+
+    @Suppress("DEPRECATION")
+    private fun selectRoute(id: String) {
+        try {
+            val device = communicationDevices().find { it.id.toString() == id }
+            if (id != "auto" && device == null) { error("That audio device is no longer connected."); publishRoutes(); return }
+            audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+            if (Build.VERSION.SDK_INT >= 31) {
+                if (device == null) audioManager.clearCommunicationDevice()
+                else check(audioManager.setCommunicationDevice(device)) { "Could not select that audio device." }
+            } else {
+                audioManager.isSpeakerphoneOn = device?.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+                if (device?.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO) audioManager.startBluetoothSco() else audioManager.stopBluetoothSco()
+            }
+            route = id; publishRoutes()
+        } catch (e: Exception) { error(e.message ?: "Could not switch audio output.") }
     }
 
     fun emit(script: String) { runOnUiThread { webView?.evaluateJavascript(script, null) } }
@@ -37,14 +91,36 @@ class MainActivity : WryActivity() {
         @JavascriptInterface fun start() { runOnUiThread {
             if (awaitingCapture || AudioShareService.running) { error("Audio sharing is already starting or running."); return@runOnUiThread }
             awaitingCapture = true
+            activeCaptureRequest = ++captureRequest
             val manager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
             @Suppress("DEPRECATION")
             val captureIntent = if (Build.VERSION.SDK_INT >= 34) {
                 manager.createScreenCaptureIntent(MediaProjectionConfig.createConfigForDefaultDisplay())
             } else manager.createScreenCaptureIntent()
-            startActivityForResult(captureIntent, 4201)
+            startActivityForResult(captureIntent, activeCaptureRequest)
         } }
         @JavascriptInterface fun stop() { runOnUiThread { awaitingCapture = false; stopService(Intent(this@MainActivity, AudioShareService::class.java)) } }
+        @JavascriptInterface fun callAudio() { runOnUiThread {
+            callActive = true
+            // Do not request exclusive audio focus: other apps must keep playing music.
+            audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+            startForegroundService(Intent(this@MainActivity, CallAudioService::class.java))
+            publishRoutes()
+        } }
+        @JavascriptInterface fun endCall() { runOnUiThread {
+            callActive = false
+            stopService(Intent(this@MainActivity, CallAudioService::class.java))
+            if (Build.VERSION.SDK_INT >= 31) audioManager.clearCommunicationDevice()
+            @Suppress("DEPRECATION")
+            if (Build.VERSION.SDK_INT < 31) { audioManager.stopBluetoothSco(); audioManager.isSpeakerphoneOn = false }
+            audioManager.mode = AudioManager.MODE_NORMAL; route = "auto"
+        } }
+        @JavascriptInterface fun routes() { runOnUiThread {
+            if (Build.VERSION.SDK_INT >= 31 && checkSelfPermission(android.Manifest.permission.BLUETOOTH_CONNECT) != android.content.pm.PackageManager.PERMISSION_GRANTED)
+                requestPermissions(arrayOf(android.Manifest.permission.BLUETOOTH_CONNECT), 4301)
+            publishRoutes()
+        } }
+        @JavascriptInterface fun route(id: String) { runOnUiThread { selectRoute(id) } }
         @JavascriptInterface fun copy(text: String) {
             val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             clipboard.setPrimaryClip(ClipData.newPlainText("MusicTalk invite", text))
@@ -54,7 +130,7 @@ class MainActivity : WryActivity() {
     @Deprecated("Platform callback retained for the capture result")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode != 4201) return
+        if (requestCode != activeCaptureRequest) return
         if (!awaitingCapture) return
         awaitingCapture = false
         if (resultCode != RESULT_OK || data == null) { error("Audio sharing was cancelled."); return }
@@ -63,9 +139,33 @@ class MainActivity : WryActivity() {
     }
 
     override fun onDestroy() {
+        audioManager.unregisterAudioDeviceCallback(devicesChanged)
+        if (Build.VERSION.SDK_INT >= 31) (routeChanged as? AudioManager.OnCommunicationDeviceChangedListener)?.let { audioManager.removeOnCommunicationDeviceChangedListener(it) }
+        AudioBridge().endCall()
         stopService(Intent(this, AudioShareService::class.java))
         current.clear()
         super.onDestroy()
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 4301 && callActive) publishRoutes()
+    }
+}
+
+// Keep microphone access eligible when the user switches to their music app.
+class CallAudioService : Service() {
+    override fun onBind(intent: Intent?) = null
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val notifications = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        notifications.createNotificationChannel(NotificationChannel("call", "Calls", NotificationManager.IMPORTANCE_LOW))
+        val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+        val notification = Notification.Builder(this, "call").setContentTitle("MusicTalk call")
+            .setContentText("Microphone active · tap to return to your call")
+            .setSmallIcon(android.R.drawable.ic_btn_speak_now).setContentIntent(open).setOngoing(true).build()
+        if (Build.VERSION.SDK_INT >= 30) startForeground(43, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+        else startForeground(43, notification)
+        return START_NOT_STICKY
     }
 }
 

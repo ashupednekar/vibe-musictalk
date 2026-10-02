@@ -31,6 +31,8 @@ target_sdk = 35
 "android.permission.FOREGROUND_SERVICE" = { description = "Keep audio sharing active while you play music." }
 "android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" = { description = "Share your device audio after you approve the system picker." }
 "android.permission.MODIFY_AUDIO_SETTINGS" = { description = "Route call audio to your headphones or speaker." }
+"android.permission.FOREGROUND_SERVICE_MICROPHONE" = { description = "Keep your microphone active during a call while playing music." }
+"android.permission.BLUETOOTH_CONNECT" = { description = "Select a connected Bluetooth headset for the call." }
 
 [android.application]
 uses_cleartext_traffic = true
@@ -43,4 +45,4 @@ UIBackgroundModes = ["audio"]
 NSAppTransportSecurity = { NSAllowsLocalNetworking = true }
 
 [android.raw]
-application = '<service android:name="dev.dioxus.main.AudioShareService" android:foregroundServiceType="mediaProjection" android:exported="false" />'
+application = '<service android:name="dev.dioxus.main.AudioShareService" android:foregroundServiceType="mediaProjection" android:exported="false" /><service android:name="dev.dioxus.main.CallAudioService" android:foregroundServiceType="microphone" android:exported="false" />'

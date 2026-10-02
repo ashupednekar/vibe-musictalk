@@ -9,11 +9,29 @@ let serverBase = new URL((!retiredTunnel && savedServer) || launch.serverUrl || 
 const smokeInvite = native && launch.testInvite ? new URL(launch.testInvite) : null;
 if (smokeInvite) serverBase = new URL(smokeInvite.origin);
 if (window.musictalk) window.musictalk.dispose();
-const state = { room: { people: [], messages: [] }, me: '', status: 'Connecting to your room…', connected: false, voice: false, muted: false, sharing: false, peer_connected: false, copied: false, error: '', notice: '', elapsed_ms: 0, room_code: '', invited: false, joining: false, can_share: (window.MusicTalkAudio && window.MusicTalkAudio.available !== false) || !!navigator.mediaDevices?.getDisplayMedia };
+const state = { room: { people: [], messages: [] }, me: '', status: 'Connecting to your room…', connected: false, voice: false, muted: false, sharing: false, music_active: false, routes: [], output: 'auto', route_label: 'Audio', peer_connected: false, copied: false, error: '', notice: '', elapsed_ms: 0, room_code: '', invited: false, joining: false, can_share: (window.MusicTalkAudio && window.MusicTalkAudio.available !== false) || !!navigator.mediaDevices?.getDisplayMedia };
 let ws, pc, mic, shared, reconnect, disposed = false, retry = 0, remoteMusicId = '', remoteVoiceId = '', makingOffer = false, ignoreOffer = false, settingAnswer = false, pendingCandidates = [], remoteTracks = [], callStarted = 0, config;
 let audioGeneration = 0, finish;
 let roomGeneration = 0;
 let smokeStarted = false;
+let earlySignals = [];
+let lastMusicAt = 0, captureMeter, captureMeterNode, captureMeterContext;
+function audioRoutes({routes, selected}) {
+    state.routes = routes; state.output = selected;
+    state.route_label = routes.find(r => r.id === selected)?.label || 'Audio'; emit();
+}
+async function refreshRoutes() {
+    if (window.MusicTalkAudio?.routes) { window.MusicTalkAudio.routes(); return; }
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    audioRoutes({routes:[{id:'',label:'System default'},...devices.filter(d=>d.kind==='audiooutput' && d.deviceId !== 'default').map((d,i)=>({id:d.deviceId,label:d.label || `Audio device ${i+1}`}))], selected:audio()?.sinkId || ''});
+}
+async function selectOutput(id) {
+    if (window.MusicTalkAudio?.route) { window.MusicTalkAudio.route(id); return; }
+    if (typeof audio()?.setSinkId !== 'function') { notice('Choose your audio output in your device’s system controls.'); return; }
+    // Apply the same route to both received streams.
+    await Promise.all([audio(),musicAudio()].map(element=>element.setSinkId(id)));
+    await refreshRoutes();
+}
 async function fetchConfig(base) {
     const response = await fetch(new URL('/api/config', base), {signal:AbortSignal.timeout(8000)});
     if (!response.ok) throw new Error('Your room is unavailable. Try the invite again in a moment.');
@@ -65,6 +83,9 @@ function buildPeer() {
         emit();
     };
     current.onnegotiationneeded = async () => {
+        // One peer starts the first offer. Simultaneous initial offers can leave
+        // Android WebView with discarded ICE transports after rollback.
+        if (!current.remoteDescription && state.me > peer()?.id) return;
         try {
             makingOffer = true;
             await current.setLocalDescription();
@@ -76,7 +97,8 @@ function buildPeer() {
     if (shared) for (const track of shared.getAudioTracks()) current.addTrack(track, shared);
 }
 async function receiveSignal(message) {
-    if (!state.voice || message.from !== peer()?.id) return;
+    if (!state.voice) { if (state.joining && earlySignals.length < 64) earlySignals.push(message); return; }
+    if (message.from !== peer()?.id) return;
     buildPeer();
     const current = pc;
     if (!current) return;
@@ -168,15 +190,19 @@ function stopSharing() {
     if (window.MusicTalkAudio) window.MusicTalkAudio.stop();
     window.musictalkNative?.cancel();
     state.sharing = false; updateVoice();
+    clearInterval(captureMeter); captureMeterNode?.disconnect(); captureMeterContext?.close();
+    captureMeter = captureMeterNode = captureMeterContext = null; lastMusicAt = 0; state.music_active = false;
     if (pc && stream) for (const sender of pc.getSenders()) if (sender.track && stream.getTracks().includes(sender.track)) pc.removeTrack(sender);
     if (stream) for (const track of stream.getTracks()) { track.onended = null; track.stop(); }
     emit();
 }
 function leaveVoice() {
     audioGeneration++;
+    earlySignals = [];
     stopSharing(); closePeer();
     if (mic) for (const track of mic.getTracks()) track.stop();
     mic = null; state.voice = false; state.muted = false;
+    window.MusicTalkAudio?.endCall?.();
     updateVoice();
     emit();
 }
@@ -226,6 +252,17 @@ function attachCapture(capture) {
     shared.getTracks().forEach(track => { track.onended = stopSharing; });
     if (pc) for (const track of shared.getAudioTracks()) pc.addTrack(track, shared);
     state.sharing = true; updateVoice(); emit();
+    // Permission is not evidence of sound. Measure the actual shared stream.
+    if (!window.MusicTalkAudio) {
+        captureMeterContext = new AudioContext();
+        captureMeterNode = captureMeterContext.createMediaStreamSource(new MediaStream(capture.getAudioTracks()));
+        const analyser = captureMeterContext.createAnalyser(); captureMeterNode.connect(analyser);
+        captureMeter = setInterval(() => {
+            const samples = new Float32Array(analyser.fftSize); analyser.getFloatTimeDomainData(samples);
+            if (samples.some(x=>Math.abs(x)>.001)) lastMusicAt = Date.now();
+        },250);
+        captureMeterContext.resume().catch(()=>{});
+    }
 }
 async function waitForRoom(generation) {
     const until = Date.now() + 12000;
@@ -264,6 +301,8 @@ async function enterCall(command) {
         send({type:'profile',name}); updateVoice();
         for (const element of [audio(),musicAudio()]) { element.srcObject ||= new MediaStream(); element.play().catch(() => {}); }
         buildPeer(); emit();
+        const queued = earlySignals; earlySignals = [];
+        for (const message of queued) await receiveSignal(message);
         capture.then(({stream,error}) => {
             if (disposed || generation !== audioGeneration || !state.voice) { stream?.getTracks().forEach(t => t.stop()); return; }
             if (error) { state.notice = 'Voice is on. Audio sharing was not started.'; emit(); return; }
@@ -274,7 +313,12 @@ async function enterCall(command) {
         capture.then(({stream}) => stream?.getTracks().forEach(t => t.stop()));
         throw error;
     } finally {
-        if (!claimedMicrophone) microphone.then(({stream}) => stream?.getTracks().forEach(t => t.stop()));
+        if (!claimedMicrophone) {
+            microphone.then(({stream}) => stream?.getTracks().forEach(t => t.stop()));
+            // Ending while the microphone prompt is pending returns through this
+            // branch. A later capture approval must also release its tracks.
+            capture.then(({stream}) => stream?.getTracks().forEach(t => t.stop()));
+        }
         if (generation === audioGeneration || !state.voice) { state.joining = false; emit(); }
     }
 }
@@ -296,6 +340,16 @@ async function action(command) {
                 mic?.getAudioTracks().forEach(track => { track.enabled = !state.muted; });
                 updateVoice(); emit(); break;
             case 'leave_voice': leaveVoice(); break;
+            case 'audio_routes': await refreshRoutes(); break;
+            case 'audio_output': await selectOutput(command.id); break;
+            case 'retry_sharing': {
+                if (!state.voice || !state.can_share) throw new Error('Device audio capture is unavailable on this device.');
+                stopSharing();
+                const generation = audioGeneration;
+                const stream = await captureAudio();
+                if (generation !== audioGeneration || !state.voice) { stream.getTracks().forEach(t=>t.stop()); break; }
+                attachCapture(stream); state.notice = ''; emit(); break;
+            }
             case 'share': {
                 if (shared) { stopSharing(); break; }
                 if (!state.voice || !state.can_share) throw new Error('Audio capture is unavailable.');
@@ -332,10 +386,25 @@ async function action(command) {
 const tick = setInterval(() => {
     if (!disposed) {
         state.elapsed_ms = callStarted ? Date.now() - callStarted : 0; emit();
+        state.music_active = state.sharing && Date.now() - lastMusicAt < 1500;
         if (state.connected && Date.now() % 10000 < 1000) { try { send({type:'ping'}); } catch {} }
+        // Only debug native builds can supply a simulator test invite. Report RTP
+        // counters to the test peer so a native-to-native test checks both ends.
+        if (smokeInvite && pc?.connectionState === 'connected') {
+            const current = pc;
+            current.getStats().then(stats => {
+                if (pc !== current || disposed) return;
+                const audioStats = [...stats.values()].filter(s => (s.type === 'inbound-rtp' || s.type === 'outbound-rtp') && s.kind === 'audio');
+                signal({testAudio:audioStats.map(s=>{
+                    const trackId = s.trackIdentifier || stats.get(s.trackId)?.trackIdentifier || current.getTransceivers().find(t=>t.mid===s.mid)?.receiver.track.id;
+                    const received = remoteTracks.find(t=>t.track.id===trackId);
+                    return {type:s.type,role:received?.streamId===remoteMusicId?'music':'voice',bytesReceived:s.bytesReceived,bytesSent:s.bytesSent,totalAudioEnergy:s.totalAudioEnergy};
+                })});
+            }).catch(()=>{});
+        }
     }
 }, 1000);
-window.musictalk = {action,dispose};
+window.musictalk = {action,dispose,audioRoutes,musicLevel(peak) { if (peak > 32) lastMusicAt = Date.now(); }};
 window.addEventListener('pagehide', dispose);
 try {
     const generation = roomGeneration;

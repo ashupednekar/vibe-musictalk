@@ -66,7 +66,7 @@ fs.mkdirSync('tests/artifacts',{recursive:true});
   await denied.getByText('Voice is on. Audio sharing was not started.',{exact:true}).waitFor();console.log('PASS declining capture keeps voice available');
   const pending=await page('pending');await pending.getByRole('button',{name:'Start a call',exact:true}).click();await pending.getByRole('button',{name:'Mute',exact:true}).waitFor();
   await pending.getByRole('button',{name:'End call',exact:true}).click();await pending.getByRole('button',{name:'Start a call',exact:true}).waitFor();
-  await pending.evaluate(()=>window.__resolveCapture());await pending.waitForFunction(()=>window.__captures.length===1&&window.__captures[0].getTracks().every(t=>t.readyState==='ended'));
+  await pending.evaluate(()=>window.__resolveCapture());try { await pending.waitForFunction(()=>window.__captures.length===1&&window.__captures[0].getTracks().every(t=>t.readyState==='ended')); } catch(e) { console.error('Late capture state:', await pending.evaluate(()=>({body:document.body.innerText,captures:window.__captures.map(s=>s.getTracks().map(t=>({kind:t.kind,state:t.readyState})))}))); throw e; }
   console.log('PASS capture approved after End is discarded');
   assert.deepEqual(errors,[]);console.log('PASS no browser runtime errors');
  }finally{await browser.close();}

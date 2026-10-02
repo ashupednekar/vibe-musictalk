@@ -25,6 +25,7 @@ static BOOL MTReadAll(int fd, void *buffer, size_t size) {
 @property(nonatomic) NSUInteger generation;
 @property(nonatomic) NSUInteger pendingFrames;
 @property(nonatomic, strong) RPSystemBroadcastPickerView *picker;
+@property(nonatomic) BOOL callActive;
 @end
 
 @implementation MTAudioBridge
@@ -33,6 +34,7 @@ static BOOL MTReadAll(int fd, void *buffer, size_t size) {
         _listener = -1; _connection = -1;
         [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(foregroundChanged:) name:UIApplicationDidEnterBackgroundNotification object:nil];
         [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(foregroundChanged:) name:UIApplicationDidBecomeActiveNotification object:nil];
+        [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(routeChanged:) name:AVAudioSessionRouteChangeNotification object:nil];
     }
     return self;
 }
@@ -64,13 +66,63 @@ static BOOL MTReadAll(int fd, void *buffer, size_t size) {
     [self.picker removeFromSuperview]; self.picker = nil;
 }
 - (void)callAudio {
+    self.callActive = YES;
     AVAudioSession *session = [AVAudioSession sharedInstance];
     NSError *error = nil;
     [session setCategory:AVAudioSessionCategoryPlayAndRecord
                    mode:AVAudioSessionModeVoiceChat
-                options:AVAudioSessionCategoryOptionMixWithOthers | AVAudioSessionCategoryOptionAllowBluetooth | AVAudioSessionCategoryOptionDefaultToSpeaker
+                options:AVAudioSessionCategoryOptionMixWithOthers | AVAudioSessionCategoryOptionAllowBluetooth
                   error:&error];
     [session setActive:YES error:&error];
+    if (error) [self error:error.localizedDescription generation:self.generation];
+    [self publishRoutes];
+}
+- (void)routeChanged:(NSNotification *)notification {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!self.callActive) return;
+        // WebKit may replace the session category when it starts its microphone.
+        // Restore mixing so that opening the call does not silence the music app.
+        if (!([AVAudioSession sharedInstance].categoryOptions & AVAudioSessionCategoryOptionMixWithOthers)) [self callAudio];
+        else [self publishRoutes];
+    });
+}
+- (void)publishRoutes {
+    AVAudioSession *session = [AVAudioSession sharedInstance];
+    NSMutableArray *routes = [@[@{@"id":@"auto",@"label":@"Automatic"},@{@"id":@"receiver",@"label":@"iPhone"},@{@"id":@"speaker",@"label":@"Speaker"}] mutableCopy];
+    NSString *selected = @"auto";
+    AVAudioSessionPortDescription *output = session.currentRoute.outputs.firstObject;
+    if ([output.portType isEqualToString:AVAudioSessionPortBuiltInSpeaker]) selected = @"speaker";
+    else if ([output.portType isEqualToString:AVAudioSessionPortBuiltInReceiver]) selected = @"receiver";
+    for (AVAudioSessionPortDescription *input in session.availableInputs) {
+        if ([input.portType isEqualToString:AVAudioSessionPortBuiltInMic]) continue;
+        [routes addObject:@{@"id":input.UID,@"label":input.portName}];
+        if ([session.currentRoute.inputs.firstObject.UID isEqualToString:input.UID]) selected = input.UID;
+    }
+    NSData *json = [NSJSONSerialization dataWithJSONObject:@{@"routes":routes,@"selected":selected} options:0 error:nil];
+    [self emit:[NSString stringWithFormat:@"window.musictalk?.audioRoutes(%@)",[[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding]] generation:self.generation];
+}
+- (void)selectRoute:(NSString *)identifier {
+    AVAudioSession *session = [AVAudioSession sharedInstance];
+    NSError *error = nil;
+    AVAudioSessionPortDescription *input = nil;
+    for (AVAudioSessionPortDescription *candidate in session.availableInputs) {
+        if ([candidate.UID isEqualToString:identifier] || ([identifier isEqualToString:@"receiver"] && [candidate.portType isEqualToString:AVAudioSessionPortBuiltInMic])) { input = candidate; break; }
+    }
+    if (!input && ![@[@"auto",@"receiver",@"speaker"] containsObject:identifier]) {
+        [self error:@"That audio device is no longer connected." generation:self.generation]; return;
+    }
+    [session overrideOutputAudioPort:AVAudioSessionPortOverrideNone error:&error];
+    if (!error) [session setPreferredInput:input error:&error];
+    if (!error && [identifier isEqualToString:@"speaker"]) [session overrideOutputAudioPort:AVAudioSessionPortOverrideSpeaker error:&error];
+    if (error) [self error:error.localizedDescription generation:self.generation];
+    [self publishRoutes];
+}
+- (void)endCall {
+    self.callActive = NO;
+    AVAudioSession *session = [AVAudioSession sharedInstance];
+    [session overrideOutputAudioPort:AVAudioSessionPortOverrideNone error:nil];
+    [session setPreferredInput:nil error:nil];
+    [session setActive:NO withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation error:nil];
 }
 - (void)start {
     [self stop]; [self callAudio];
@@ -146,6 +198,9 @@ static BOOL MTReadAll(int fd, void *buffer, size_t size) {
     if ([action isEqualToString:@"start"]) [self start];
     else if ([action isEqualToString:@"stop"]) [self stop];
     else if ([action isEqualToString:@"callAudio"]) [self callAudio];
+    else if ([action isEqualToString:@"endCall"]) [self endCall];
+    else if ([action isEqualToString:@"routes"]) [self publishRoutes];
+    else if ([action isEqualToString:@"route"]) [self selectRoute:message.body[@"id"]];
     else if ([action isEqualToString:@"copy"]) [UIPasteboard generalPasteboard].string = message.body[@"text"];
 }
 @end
@@ -161,6 +216,6 @@ void musictalk_ios_install(void *rawWebview) {
     [manager addScriptMessageHandler:bridge name:@"MusicTalkAudio"];
     BOOL available = !TARGET_OS_SIMULATOR && [[NSFileManager defaultManager] fileExistsAtPath:[[[NSBundle mainBundle] builtInPlugInsPath] stringByAppendingPathComponent:@"MusicTalkBroadcast.appex"]];
     NSString *script = [NSString stringWithFormat:
-        @"window.MusicTalkAudio={available:%@,start(){webkit.messageHandlers.MusicTalkAudio.postMessage({action:'start'})},stop(){webkit.messageHandlers.MusicTalkAudio.postMessage({action:'stop'})},callAudio(){webkit.messageHandlers.MusicTalkAudio.postMessage({action:'callAudio'})},copy(text){webkit.messageHandlers.MusicTalkAudio.postMessage({action:'copy',text})}};", available ? @"true" : @"false"];
+        @"window.MusicTalkAudio={available:%@,start(){webkit.messageHandlers.MusicTalkAudio.postMessage({action:'start'})},stop(){webkit.messageHandlers.MusicTalkAudio.postMessage({action:'stop'})},callAudio(){webkit.messageHandlers.MusicTalkAudio.postMessage({action:'callAudio'})},endCall(){webkit.messageHandlers.MusicTalkAudio.postMessage({action:'endCall'})},routes(){webkit.messageHandlers.MusicTalkAudio.postMessage({action:'routes'})},route(id){webkit.messageHandlers.MusicTalkAudio.postMessage({action:'route',id})},copy(text){webkit.messageHandlers.MusicTalkAudio.postMessage({action:'copy',text})}};", available ? @"true" : @"false"];
     [webview evaluateJavaScript:script completionHandler:nil];
 }

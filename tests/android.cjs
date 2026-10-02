@@ -21,6 +21,7 @@ function tapNode(xml, attribute, value) {
 function hierarchy() { adb('shell', 'uiautomator', 'dump', '/sdcard/musictalk-test.xml'); return adb('shell', 'cat', '/sdcard/musictalk-test.xml'); }
 (async () => {
     adb('shell', 'pm', 'grant', 'dev.musictalk', 'android.permission.RECORD_AUDIO');
+    adb('shell', 'pm', 'grant', 'dev.musictalk', 'android.permission.BLUETOOTH_CONNECT');
     adb('shell', 'am', 'force-stop', 'dev.musictalk');
     adb('reverse', 'tcp:8080', 'tcp:8080');
     adb('shell', 'am', 'start', '-n', 'dev.musictalk/dev.dioxus.main.MainActivity');
@@ -48,28 +49,37 @@ function hierarchy() { adb('shell', 'uiautomator', 'dump', '/sdcard/musictalk-te
         const page = await browser.newPage({ permissions: ['microphone'] });
         await page.addInitScript(() => { window.__pcs = []; window.RTCPeerConnection = new Proxy(window.RTCPeerConnection, { construct(t, a) { const pc = new t(...a); window.__pcs.push(pc); return pc; } }); });
         await page.goto(`${process.env.TEST_BASE_URL || 'http://127.0.0.1:8080'}/?room=${room}`);
-        await page.getByText('2/2', { exact: true }).waitFor();
-        await page.getByRole('button', { name: 'Join the conversation', exact: true }).click();
+        await page.evaluate(() => { navigator.mediaDevices.getDisplayMedia = async () => { throw new DOMException('Test peer does not share', 'NotAllowedError'); }; });
+        await page.getByRole('button', { name: 'Start a call', exact: true }).click();
         await evaluate("window.musictalk.action({type:'join_voice',name:'Android'});true");
-        await page.getByText('Together, live', { exact: true }).waitFor({ timeout: 30000 });
-        console.log('PASS installed APK microphone connects over WebRTC');
-        await evaluate("window.musictalk.action({type:'share'});true");
         await delay(1000);
         let xml = hierarchy();
-        tapNode(xml, 'resource-id', 'android:id/button1');
+        if (xml.includes('android:id/button1')) tapNode(xml, 'resource-id', 'android:id/button1');
+        try { await page.waitForFunction(() => window.__pcs.at(-1)?.connectionState === 'connected'); } catch(e) { console.error('Browser peer:', await page.evaluate(() => ({body:document.body.innerText,peers:window.__pcs.map(p=>({state:p.connectionState,signal:p.signalingState,local:p.localDescription?.sdp,remote:p.remoteDescription?.sdp}))}))); throw e; }
+        console.log('PASS installed APK microphone connects over WebRTC');
         await until(() => evaluate('window.__pcs.at(-1)?.getSenders().filter(s=>s.track).length===2'));
         await until(() => evaluate('window.__pcmChunks > 10'));
         assert.deepEqual(await evaluate('window.__pcs.at(-1).getSenders().filter(s=>s.track).map(s=>s.track.kind)'), ['audio', 'audio']);
         await page.waitForFunction(async () => { const stats = await window.__pcs.at(-1).getStats(); return [...stats.values()].filter(s => s.type === 'inbound-rtp' && s.kind === 'audio' && s.bytesReceived > 100).length === 2; }, {}, { timeout: 20000 });
         assert.ok(adb('shell', 'dumpsys', 'activity', 'services', 'dev.musictalk').includes('AudioShareService'));
         console.log('PASS native PCM capture and separate microphone/music RTP; no video senders');
+        await evaluate('window.MusicTalkAudio.routes();true');
+        await until(() => evaluate('!!document.querySelector(".audio-route-button")'));
+        await evaluate('document.querySelector(".audio-route-button").click();true');
+        await until(() => evaluate('!![...document.querySelectorAll(".audio-choice")].find(b=>b.textContent.includes("Speaker"))'));
+        await evaluate('[...document.querySelectorAll(".audio-choice")].find(b=>b.textContent.includes("Speaker")).click();true');
+        await until(() => evaluate('document.querySelector(".audio-route-button").textContent.includes("Speaker")'));
+        console.log('PASS Android output picker switches to speaker');
         // Play sound in a different Android app, with MusicTalk in the background.
         try {
             adb('shell', 'am', 'start', '-n', 'dev.musictalk.testtone/.ToneActivity');
             await until(() => evaluate('window.__pcmPeak > 500'), 15000);
             await page.evaluate(() => { const ctx = new AudioContext(); const source = ctx.createMediaStreamSource(document.getElementById('remote-music').srcObject); window.__musicAnalyser = ctx.createAnalyser(); source.connect(window.__musicAnalyser); window.__musicContext = ctx; });
             await page.waitForFunction(() => { const samples = new Float32Array(window.__musicAnalyser.fftSize); window.__musicAnalyser.getFloatTimeDomainData(samples); return samples.some(x => Math.abs(x) > .01); }, {}, { timeout: 15000 });
-            console.log('PASS sound from another Android app captured in background and heard by remote peer');
+            await until(() => evaluate('document.body.innerText.includes("Sharing your device audio")'));
+            await page.waitForFunction(async () => { const s = await window.__pcs.at(-1).getStats(); return [...s.values()].filter(x=>x.type==='inbound-rtp' && x.kind==='audio' && x.bytesReceived>100).length===2; });
+            assert.ok(adb('shell','dumpsys','activity','services','dev.musictalk').includes('CallAudioService'));
+            console.log('PASS sound from another Android app captured in background and heard by remote peer, while microphone service stays active');
         } finally {
             adb('shell', 'am', 'force-stop', 'dev.musictalk.testtone');
             adb('shell', 'am', 'start', '-n', 'dev.musictalk/dev.dioxus.main.MainActivity');
@@ -77,12 +87,12 @@ function hierarchy() { adb('shell', 'uiautomator', 'dump', '/sdcard/musictalk-te
         fs.mkdirSync('tests/artifacts', { recursive: true });
         const shot = await call('Page.captureScreenshot', { format: 'png' });
         fs.writeFileSync('tests/artifacts/android.png', Buffer.from(shot.result.data, 'base64'));
-        await evaluate("window.musictalk.action({type:'share'});true");
+        await evaluate("window.musictalk.action({type:'end_call'});true");
         await until(() => !adb('shell', 'dumpsys', 'activity', 'services', 'dev.musictalk').includes('AudioShareService'));
-        console.log('PASS native capture service released');
+        assert.ok(!adb('shell','dumpsys','activity','services','dev.musictalk').includes('CallAudioService')); console.log('PASS native capture and microphone services released');
         await evaluate("window.musictalk.action({type:'leave_voice'});true");
     } catch (error) {
-        console.error('Native failure state:', await evaluate('JSON.stringify({body:document.body.innerText,actions:window.__actions,peers:window.__pcs.map(p=>({connection:p.connectionState,ice:p.iceConnectionState,signaling:p.signalingState}))})'));
+        console.error('Native failure state:', await evaluate('JSON.stringify({body:document.body.innerText,actions:window.__actions,peers:window.__pcs.map(p=>({connection:p.connectionState,ice:p.iceConnectionState,signaling:p.signalingState,local:p.localDescription?.sdp,remote:p.remoteDescription?.sdp,tracks:p.getSenders().map(s=>({state:s.track?.readyState}))}))})'));
         throw error;
     } finally {
         await evaluate('document.body.style.pointerEvents="";window.musictalk.action({type:"leave_voice"});true');
